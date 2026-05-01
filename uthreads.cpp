@@ -1,13 +1,19 @@
 #include "uthreads.h"
 
 #include <iostream>
-#include <queue>
-#include <unordered_map>
+#include <list>
+#include <vector>
+#include <setjmp.h>
+#include <csignal>
+
+//  מוסכמות 
+//  if there is no thread of id tid so threads[tid] = nullptr 
+// a thread is in ready_queue if & only if its state is READY
 
 enum State {
     RUNNING,
     READY,
-    BLOCKED
+    BLOCKED,
 };
 
 struct Thread {
@@ -15,11 +21,20 @@ struct Thread {
     State state;
     int quantums;
     thread_entry_point entry_point;
-    char* stack;
+    char* stack = nullptr;
+    sigjmp_buf env;
+
+    std::list<int>::iterator ready_it;
+    bool in_ready = false;
+
+    bool is_manually_blocked = false;
+
+    int sleep_remaining = 0;
+
 
     Thread(int id, State st, thread_entry_point entry)
         : tid(id), state(st), quantums(0),
-          entry_point(entry), stack(nullptr) {}
+          entry_point(entry){}
 };
 
 class IDManager {
@@ -36,7 +51,7 @@ public:
     }
 
     int allocate() {
-        for (int i = 0; i < MAX_THREAD_NUM; i++) {
+        for (int i = 1; i < MAX_THREAD_NUM; i++) {
             if (thread_cnt == MAX_THREAD_NUM){
                 return -1;
             }
@@ -57,10 +72,29 @@ public:
     }
 };
 
-static int current_tid = 0;
-static std::queue<int> ready_queue;
-static IDManager id_manager; 
-static std::unordered_map<int, Thread*> thread_table;
+typedef unsigned long address_t;
+#define JB_SP 6
+#define JB_PC 7 
+
+/* A translation is required when using an address of a variable.
+   Use this as a black box in your code. */
+address_t translate_address(address_t addr)
+{
+    address_t ret;
+    asm volatile("xor    %%fs:0x30,%0\n"
+        "rol    $0x11,%0\n"
+                 : "=g" (ret)
+                 : "0" (addr));
+    return ret;
+}
+
+
+static int current_tid;
+static int total_quantums;
+static std::vector<Thread*> threads(MAX_THREAD_NUM, nullptr);
+static std::list<int> ready_queue;
+static IDManager id_manager;
+static int thread_to_delete = -1;
 
 /**
  * @brief initializes the thread library.
@@ -79,11 +113,31 @@ int uthread_init(int quantum_usecs) {
         std::cerr << "thread library error: invalid quantum" << std::endl;
         return -1;
     }
-    id_manager.allocate();
-    current_tid = 0; 
-    Thread* main_thread = new Thread(0, RUNNING, nullptr);
-    thread_table.insert({0, main_thread});
+    current_tid = 0;
+    total_quantums = 1;
+    Thread* main_thread = new Thread(current_tid, RUNNING, nullptr);
+    main_thread->quantums = 1;
+    threads[current_tid] = main_thread;
     return 0;
+}
+
+
+void thread_start() {
+    Thread* t = threads[current_tid];
+    t->entry_point();
+    uthread_terminate(current_tid);
+    // should never reach here
+    while (true);
+}
+
+
+void setup_thread_context(Thread* thread){
+    address_t sp = (address_t) thread->stack + STACK_SIZE - sizeof(address_t);
+    address_t pc = (address_t) thread_start;
+    sigsetjmp(thread->env, 1);
+   (thread->env->__jmpbuf)[JB_SP] = translate_address(sp);
+    (thread->env->__jmpbuf)[JB_PC] = translate_address(pc);
+    sigemptyset(&thread->env->__saved_mask);
 }
 
 /**
@@ -100,7 +154,7 @@ int uthread_init(int quantum_usecs) {
 */
 int uthread_spawn(thread_entry_point entry_point) {
     if (entry_point == nullptr){
-        std::cerr << "thread library error: " << "entery point must be provided" << std::endl;
+        std::cerr << "thread library error: " << "entry point must be provided" << std::endl;
         return -1;   
     }
     int tid = id_manager.allocate();
@@ -109,18 +163,88 @@ int uthread_spawn(thread_entry_point entry_point) {
         return -1;
     }
     Thread* thread = new Thread(tid, READY, entry_point);
-    thread->stack = new (std::nothrow) char[STACK_SIZE];
-    if (thread->stack == nullptr) {
+//     // allocate stack for thread
+    char* stack = new (std::nothrow) char[STACK_SIZE];
+    if (stack == nullptr) {
         std::cerr << "system error: memory allocation failed" << std::endl;
         id_manager.release(tid);  
         delete thread;
         exit(1);
     }
-    thread_table.insert({tid, thread});
-    ready_queue.push(tid);
+    thread->stack = stack;
+    threads[tid] = thread;
+    ready_queue.push_back(tid);
+    thread->in_ready = true;
+    thread->ready_it = std::prev(ready_queue.end());
+    setup_thread_context(thread);
     return tid;
 }
 
+/**
+ * @brief Deleates the thread with ID tid and deletes it from all relevant control structures.
+ *
+ *
+ * @return The function returns 0 if the thread was successfully deleted and -1 otherwise. 
+*/
+int delete_thread(int tid){
+    Thread* thread = threads[tid];
+    if (!thread || thread->state == RUNNING) return -1;
+    if (thread->in_ready && thread->ready_it != ready_queue.end()){
+        ready_queue.erase(thread->ready_it);
+        thread->in_ready = false;
+    }
+    if (thread->stack != nullptr) {
+        delete[] thread->stack;
+        thread->stack = nullptr;
+    }
+    id_manager.release(tid);
+    threads[tid] = nullptr;
+    delete thread;
+    return 0;
+}
+
+int context_switch(){
+    int prev_tid = current_tid;
+    Thread* prev = threads[prev_tid];
+    if (sigsetjmp(prev->env, 1) == 0) {
+        if (prev->state == RUNNING) {
+            prev->state = READY;
+            ready_queue.push_back(prev_tid);
+            prev->in_ready = true;
+            prev->ready_it = std::prev(ready_queue.end());
+        }
+        if (ready_queue.empty()) {
+            return -1; // nothing to run
+        }
+        int next_tid = ready_queue.front();
+        ready_queue.pop_front();
+        Thread* next = threads[next_tid];
+        next->state = RUNNING;
+        next->in_ready = false;
+        current_tid = next_tid;
+        next->quantums++;
+        total_quantums++;
+        siglongjmp(next->env, 1);
+    }
+    if (thread_to_delete != -1) {
+        int tid = thread_to_delete;
+        thread_to_delete = -1;
+        delete_thread(tid);
+    }
+    return 0;
+}
+
+void terminate_process(){
+    for (Thread* t : threads){
+        if (t->stack != nullptr){
+                delete[] t->stack;
+            }
+        delete t;
+    }
+    threads.clear();
+    ready_queue.clear();
+    exit(0);
+}
 
 /**
  * @brief Terminates the thread with ID tid and deletes it from all relevant control structures.
@@ -133,38 +257,23 @@ int uthread_spawn(thread_entry_point entry_point) {
  * itself or the main thread is terminated, the function does not return.
 */
 int uthread_terminate(int tid){
-    // todo: what happens if a thread terminates itself?
-    auto it = thread_table.find(tid);
-    if (it == thread_table.end()) {
-            std::cerr << "thread does not exist\n";
-            return -1;
-        }
-    Thread* thread = it->second;
-    // special case: main thread
+    if (threads[tid] == nullptr){
+        std::cerr << "thread " << tid << " dose not exist." << std::endl;
+        return -1;
+    }
+// special case: main thread
     if (tid == 0) {
-        delete[] thread->stack;
-        thread_table.erase(0);
-		id_manager.release(0);
-        delete thread;
-        exit(0);
+        terminate_process();
     }
-    // todo: check if there is a better way to do this
-    // erase from queue
-    std::queue<int> temp;
-    while (!ready_queue.empty()) {
-        int cur = ready_queue.front();
-        ready_queue.pop();
-        if (cur != tid) {
-            temp.push(cur);
-        }
+    if(tid == current_tid){
+        Thread* t = threads[tid];
+        t->state = BLOCKED;
+        thread_to_delete = current_tid;
+        context_switch();
     }
-    ready_queue = temp;
-
-    char* stack_ptr = thread->stack;
-    thread_table.erase(tid);
-    id_manager.release(tid);
-    delete[] stack_ptr;
-    delete thread;
+    else{
+        delete_thread(tid);
+    }
     return 0;
 }
 
@@ -215,8 +324,17 @@ int uthread_resume(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_sleep(int num_quantums) {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
+    // just for now
+    if (num_quantums != 0){
+        std::cerr << "thread library error: " << "num_quantums should be 0" << std::endl;
+        return -1;
+    }
+    if (current_tid==0 && num_quantums!=0){
+        std::cerr << "thread library error: " << "cannot put main thread to sleep" << std::endl;
+        return -1;
+    }
+    context_switch();
+    return 0;
 }
 
 
@@ -239,8 +357,7 @@ int uthread_get_tid() {
  * @return The total number of quantums.
 */
 int uthread_get_total_quantums() {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
+    return total_quantums;
 }
 
 
@@ -254,6 +371,10 @@ int uthread_get_total_quantums() {
  * @return On success, return the number of quantums of the thread with ID tid. On failure, return -1.
 */
 int uthread_get_quantums(int tid) {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
+    Thread*  thread = threads[tid];
+    if (thread == nullptr) {
+            std::cerr << "thread does not exist\n";
+            return -1;
+        }
+    return thread->quantums;
 }
