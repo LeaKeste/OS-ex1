@@ -25,7 +25,6 @@ struct Thread {
     sigjmp_buf env;
 
     std::list<int>::iterator ready_it;
-    bool in_ready = false;
 
     bool is_manually_blocked = false;
 
@@ -174,7 +173,6 @@ int uthread_spawn(thread_entry_point entry_point) {
     thread->stack = stack;
     threads[tid] = thread;
     ready_queue.push_back(tid);
-    thread->in_ready = true;
     thread->ready_it = std::prev(ready_queue.end());
     setup_thread_context(thread);
     return tid;
@@ -187,11 +185,18 @@ int uthread_spawn(thread_entry_point entry_point) {
  * @return The function returns 0 if the thread was successfully deleted and -1 otherwise. 
 */
 int delete_thread(int tid){
+    if (tid > MAX_THREAD_NUM){
+        std::cerr << "thread " << tid << " dose not exist" << std::endl;
+        return -1;
+    }
     Thread* thread = threads[tid];
+    if (thread == nullptr){
+        std::cerr << "thread " << tid << " dose not exist" << std::endl;
+        return -1;
+    }
     if (!thread || thread->state == RUNNING) return -1;
-    if (thread->in_ready && thread->ready_it != ready_queue.end()){
+    if (thread->state == READY){
         ready_queue.erase(thread->ready_it);
-        thread->in_ready = false;
     }
     if (thread->stack != nullptr) {
         delete[] thread->stack;
@@ -210,7 +215,6 @@ int context_switch(){
         if (prev->state == RUNNING) {
             prev->state = READY;
             ready_queue.push_back(prev_tid);
-            prev->in_ready = true;
             prev->ready_it = std::prev(ready_queue.end());
         }
         if (ready_queue.empty()) {
@@ -220,7 +224,6 @@ int context_switch(){
         ready_queue.pop_front();
         Thread* next = threads[next_tid];
         next->state = RUNNING;
-        next->in_ready = false;
         current_tid = next_tid;
         next->quantums++;
         total_quantums++;
@@ -288,8 +291,28 @@ int uthread_terminate(int tid){
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_block(int tid) {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
+    if (tid == 0){
+        std::cerr << "cant block main thread." << std::endl;
+        return -1;
+    }
+    if (tid > MAX_THREAD_NUM){
+        std::cerr << "thread " << tid << " dose not exist" << std::endl;
+        return -1;
+    }
+    Thread* thread = threads[tid];
+    if (thread == nullptr){
+        std::cerr << "thread " << tid << " dose not exist" << std::endl;
+        return -1;
+    }
+    // what if a thread blocks itself  ==== blocks the ruuning ? 
+    if (thread->state == READY){
+        ready_queue.erase(thread->ready_it);
+    }
+    thread->state = BLOCKED;
+    if (tid == current_tid){
+        context_switch();
+    }
+    return 0;
 }
 
 
@@ -303,8 +326,21 @@ int uthread_block(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_resume(int tid) {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
+    if (tid > MAX_THREAD_NUM){
+        std::cerr << "thread " << tid << " dose not exist" << std::endl;
+        return -1;
+    }
+    Thread* thread = threads[tid];
+    if (thread == nullptr){
+        std::cerr << "thread " << tid << " dose not exist" << std::endl;
+        return -1;
+    }
+    if (thread->sleep_remaining == 0){
+        ready_queue.push_back(tid);
+        thread->ready_it = std::prev(ready_queue.end());
+        thread->state = READY;
+    }
+    return 0;
 }
 
 
